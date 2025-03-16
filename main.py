@@ -13,6 +13,13 @@ import plotly.graph_objects as go
 from pygments import highlight
 from pygments.lexers import get_lexer_by_name
 from pygments.formatters import HtmlFormatter
+from dotenv import load_dotenv
+import subprocess
+import tempfile
+import traceback
+
+# Load environment variables
+load_dotenv()
 
 # Set page configuration
 st.set_page_config(page_title="Programming TA", page_icon="💻", layout="wide")
@@ -26,13 +33,15 @@ if 'current_student' not in st.session_state:
     st.session_state.current_student = None
 if 'submissions' not in st.session_state:
     st.session_state.submissions = {}
+if 'execution_output' not in st.session_state:
+    st.session_state.execution_output = None
 
 
 # Groq API configuration
-def configure_groq_api():
-    api_key = st.session_state.get("groq_api_key", "")
+def get_groq_api_key():
+    api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
-        st.sidebar.error("Please enter your Groq API key")
+        st.sidebar.error("GROQ_API_KEY not found in .env file")
     return api_key
 
 
@@ -48,9 +57,76 @@ def format_code(code, language):
         return f"<pre>{code}</pre>"
 
 
+# Function to execute code
+def execute_code(code, language):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        try:
+            if language == "python":
+                file_path = os.path.join(tmpdir, "code.py")
+                with open(file_path, "w") as f:
+                    f.write(code)
+
+                # Set timeout to prevent infinite loops
+                proc = subprocess.run(
+                    ["python", file_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+
+                return {
+                    "stdout": proc.stdout,
+                    "stderr": proc.stderr,
+                    "returncode": proc.returncode,
+                    "success": proc.returncode == 0
+                }
+
+            elif language == "javascript":
+                file_path = os.path.join(tmpdir, "code.js")
+                with open(file_path, "w") as f:
+                    f.write(code)
+
+                proc = subprocess.run(
+                    ["node", file_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+
+                return {
+                    "stdout": proc.stdout,
+                    "stderr": proc.stderr,
+                    "returncode": proc.returncode,
+                    "success": proc.returncode == 0
+                }
+
+            else:
+                return {
+                    "stdout": "",
+                    "stderr": f"Code execution not supported for {language}",
+                    "returncode": -1,
+                    "success": False
+                }
+
+        except subprocess.TimeoutExpired:
+            return {
+                "stdout": "",
+                "stderr": "Execution timed out. Check for infinite loops or long-running operations.",
+                "returncode": -1,
+                "success": False
+            }
+        except Exception as e:
+            return {
+                "stdout": "",
+                "stderr": f"Error executing code: {str(e)}\n{traceback.format_exc()}",
+                "returncode": -1,
+                "success": False
+            }
+
+
 # Function to analyze code using Groq API
 def analyze_code(code, language, student_id, assignment_name):
-    api_key = configure_groq_api()
+    api_key = get_groq_api_key()
     if not api_key:
         return None
 
@@ -67,6 +143,8 @@ def analyze_code(code, language, student_id, assignment_name):
     # Format prompt for the LLM
     prompt = f"""
     You are an expert programming teacher's assistant. Analyze the following {language} code submission for a student.
+    You need to be strict and have to analyze each and every part of the code.
+    Also score score better readability of the code.
 
     STUDENT INFORMATION:
     - Student ID: {student_id}
@@ -201,65 +279,144 @@ def analyze_code(code, language, student_id, assignment_name):
         return None
 
 
-# Main app layout
-def main():
-    st.title("💻 AI Programming Teaching Assistant")
+# Student analytics interface
+def display_student_analytics():
+    st.header("Student Analytics Dashboard")
 
-    # Sidebar for configuration
-    with st.sidebar:
-        st.header("Configuration")
+    if not st.session_state.current_student:
+        st.warning("Please select or add a student from the sidebar")
+        return
 
-        # API Key input
-        if "groq_api_key" not in st.session_state:
-            st.session_state.groq_api_key = ""
+    student_id = st.session_state.current_student
 
-        api_key = st.text_input("Enter Groq API Key:", value=st.session_state.groq_api_key, type="password")
-        if api_key != st.session_state.groq_api_key:
-            st.session_state.groq_api_key = api_key
+    if student_id not in st.session_state.student_profiles or not st.session_state.student_profiles[student_id]["history"]:
+        st.info("No data available for this student yet")
+        return
 
-        st.divider()
+    profile = st.session_state.student_profiles[student_id]
 
-        # Student selection
-        st.subheader("Student Management")
+    # Overview metrics
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Total Submissions", profile["submissions"])
+    with col2:
+        if profile["progress"]:
+            latest_grade = profile["progress"][-1]["grade"]
+            st.metric("Latest Grade", f"{latest_grade}/100")
+    with col3:
+        if len(profile["progress"]) > 1:
+            first_grade = profile["progress"][0]["grade"]
+            latest_grade = profile["progress"][-1]["grade"]
+            improvement = latest_grade - first_grade
+            st.metric("Overall Improvement", f"{improvement} points", delta=improvement)
 
-        # Add new student
-        new_student = st.text_input("Add new student ID:")
-        if st.button("Add Student") and new_student:
-            if new_student not in st.session_state.student_profiles:
-                st.session_state.student_profiles[new_student] = {
-                    "history": [],
-                    "submissions": 0,
-                    "common_issues": {},
-                    "strengths": {},
-                    "progress": []
-                }
-                st.success(f"Added student: {new_student}")
+    # Progress over time
+    st.subheader("Grade Progress")
+    if profile["progress"]:
+        progress_df = pd.DataFrame(profile["progress"])
+        fig = px.line(progress_df, x="timestamp", y="grade", markers=True,
+                      labels={"timestamp": "Submission Date", "grade": "Grade"},
+                      title="Grade Progress Over Time")
+        fig.update_layout(hovermode="x unified")
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Submission history
+    st.subheader("Submission History")
+    if profile["history"]:
+        history_df = pd.DataFrame(profile["history"])
+
+        # Get unique key issues
+        all_issues = []
+        for entry in profile["history"]:
+            all_issues.extend(entry.get("key_issues", []))
+
+        # Count issue occurrences
+        issue_counts = {}
+        for issue in all_issues:
+            if issue in issue_counts:
+                issue_counts[issue] += 1
             else:
-                st.warning(f"Student {new_student} already exists")
+                issue_counts[issue] = 1
 
-        # Select existing student
-        students = list(st.session_state.student_profiles.keys())
-        if students:
-            selected_student = st.selectbox("Select Student:", options=students)
-            if selected_student != st.session_state.current_student:
-                st.session_state.current_student = selected_student
-                st.rerun()  # Use st.rerun() instead of st.experimental_rerun()
-        else:
-            st.info("No students added yet")
+        # Common issues chart
+        if issue_counts:
+            st.subheader("Common Issues")
+            issue_df = pd.DataFrame(
+                {"Issue": list(issue_counts.keys()), "Count": list(issue_counts.values())})
+            issue_df = issue_df.sort_values("Count", ascending=False).head(5)
 
-        st.divider()
+            fig = px.bar(issue_df, x="Count", y="Issue", orientation="h",
+                         title="Top 5 Most Common Issues")
+            st.plotly_chart(fig, use_container_width=True)
 
-        # App navigation
-        st.subheader("Navigation")
-        app_mode = st.radio("Select Mode:", ["Code Submission", "Student Analytics", "Class Overview"])
+        # Submission details
+        st.subheader("Recent Submissions")
+        for i, entry in enumerate(reversed(profile["history"])):
+            if i >= 5:  # Show only the 5 most recent submissions
+                break
 
-    # Main content area based on selected mode
-    if app_mode == "Code Submission":
-        display_code_submission()
-    elif app_mode == "Student Analytics":
-        display_student_analytics()
-    else:  # Class Overview
-        display_class_overview()
+            with st.expander(f"{entry['assignment']} - {entry['timestamp']}"):
+                st.write(f"**Grade:** {entry['grade_estimate']}")
+                if entry.get("key_issues"):
+                    st.write("**Key Issues:**")
+                    for issue in entry["key_issues"]:
+                        st.write(f"- {issue}")
+
+
+# Class overview interface
+def display_class_overview():
+    st.header("Class Overview Dashboard")
+
+    if not st.session_state.student_profiles:
+        st.info("No student data available yet")
+        return
+
+    # General class metrics
+    total_students = len(st.session_state.student_profiles)
+    total_submissions = sum(
+        profile["submissions"] for profile in st.session_state.student_profiles.values())
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("Total Students", total_students)
+    with col2:
+        st.metric("Total Submissions", total_submissions)
+
+    # Student activity
+    st.subheader("Student Activity")
+
+    activity_data = []
+    for student_id, profile in st.session_state.student_profiles.items():
+        if profile["progress"]:
+            latest_grade = profile["progress"][-1]["grade"]
+            avg_grade = sum(entry["grade"] for entry in profile["progress"]) / len(profile["progress"])
+            activity_data.append({
+                "Student ID": student_id,
+                "Submissions": profile["submissions"],
+                "Latest Grade": latest_grade,
+                "Average Grade": round(avg_grade, 1)
+            })
+
+    if activity_data:
+        activity_df = pd.DataFrame(activity_data)
+        st.dataframe(activity_df.sort_values("Latest Grade", ascending=False), use_container_width=True)
+
+        # Grade distribution
+        st.subheader("Grade Distribution")
+
+        fig = px.histogram(activity_df, x="Latest Grade", nbins=10,
+                           title="Distribution of Latest Grades")
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("No grade data available yet")
+
+    # Recent feedback
+    st.subheader("Recent Feedback")
+
+    if st.session_state.feedback_history:
+        history = sorted(st.session_state.feedback_history, key=lambda x: x["timestamp"], reverse=True)[:10]
+        history_df = pd.DataFrame(history)
+        st.dataframe(history_df, use_container_width=True)
 
 
 # Code submission interface
@@ -273,27 +430,66 @@ def display_code_submission():
     student_id = st.session_state.current_student
     st.subheader(f"Student: {student_id}")
 
-    col1, col2 = st.columns([3, 2])
+    tab1, tab2 = st.tabs(["Submit & Analyze", "View Feedback"])
 
-    with col1:
-        # Code input
-        st.subheader("Submit Code")
-        language = st.selectbox("Programming Language:",
-                                ["python", "java", "javascript", "cpp", "c", "csharp", "go", "ruby", "php"])
+    with tab1:
+        col1, col2 = st.columns([3, 2])
 
-        assignment_name = st.text_input("Assignment Name:", "Assignment 1")
+        with col1:
+            # Code input
+            st.subheader("Submit Code")
+            language = st.selectbox("Programming Language:",
+                                    ["python", "javascript", "java", "cpp", "c", "csharp", "go", "ruby", "php"])
 
-        code = st.text_area("Code:", height=300, placeholder="Paste your code here...")
+            assignment_name = st.text_input("Assignment Name:", "Assignment 1")
 
-        if st.button("Analyze Code") and code:
-            with st.spinner("Analyzing code..."):
-                feedback = analyze_code(code, language, student_id, assignment_name)
-                if feedback:
-                    st.success("Analysis complete!")
-                    st.rerun()  # Use st.rerun() instead of st.experimental_rerun()
+            code = st.text_area("Code:", height=300, placeholder="Paste your code here...")
 
-    with col2:
-        # Feedback display
+            col_analyze, col_run, _ = st.columns([1, 1, 2])
+
+            with col_analyze:
+                if st.button("🔍 Analyze Code", use_container_width=True) and code:
+                    with st.spinner("Analyzing code..."):
+                        feedback = analyze_code(code, language, student_id, assignment_name)
+                        if feedback:
+                            st.success("Analysis complete!")
+                            st.rerun()
+
+            with col_run:
+                if st.button("▶️ Run Code", use_container_width=True) and code:
+                    if language not in ["python", "javascript"]:
+                        st.warning(
+                            f"Running {language} code is not supported yet. Only Python and JavaScript execution is available.")
+                    else:
+                        with st.spinner(f"Running {language} code..."):
+                            execution_result = execute_code(code, language)
+                            st.session_state.execution_output = execution_result
+                            st.rerun()
+
+        with col2:
+            # Code execution output
+            st.subheader("Execution Results")
+            if st.session_state.execution_output:
+                result = st.session_state.execution_output
+                if result["success"]:
+                    st.success("Code executed successfully")
+                else:
+                    st.error(f"Execution failed (return code: {result['returncode']})")
+
+                # Standard output
+                if result["stdout"]:
+                    with st.expander("Standard Output", expanded=True):
+                        st.code(result["stdout"])
+
+                # Standard error
+                if result["stderr"]:
+                    with st.expander("Error Output", expanded=True):
+                        st.code(result["stderr"])
+            else:
+                st.info("No code has been executed yet. Click 'Run Code' to see results.")
+
+    with tab2:
+        # Feedback display for previous submissions
         st.subheader("Previous Submissions")
 
         if student_id in st.session_state.submissions and len(st.session_state.submissions[student_id]) > 0:
@@ -390,143 +586,65 @@ def display_code_submission():
             st.info("No submissions found for this student")
 
 
-# Student analytics interface
-def display_student_analytics():
-    st.header("Student Analytics Dashboard")
+# Main app layout
+def main():
+    st.title("💻 AI Programming Teaching Assistant")
 
-    if not st.session_state.current_student:
-        st.warning("Please select or add a student from the sidebar")
-        return
+    # Sidebar for configuration
+    with st.sidebar:
+        st.header("Configuration")
 
-    student_id = st.session_state.current_student
+        # Check API Key
+        api_key = get_groq_api_key()
+        if api_key:
+            st.success("✓ Groq API Key configured")
+        else:
+            st.error("❌ Groq API Key missing")
+            st.info("Create a .env file in the same directory with GROQ_API_KEY=your_key_here")
 
-    if student_id not in st.session_state.student_profiles or not st.session_state.student_profiles[student_id][
-        "history"]:
-        st.info("No data available for this student yet")
-        return
+        st.divider()
 
-    profile = st.session_state.student_profiles[student_id]
+        # Student selection
+        st.subheader("Student Management")
 
-    # Overview metrics
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Total Submissions", profile["submissions"])
-    with col2:
-        if profile["progress"]:
-            latest_grade = profile["progress"][-1]["grade"]
-            st.metric("Latest Grade", f"{latest_grade}/100")
-    with col3:
-        if len(profile["progress"]) > 1:
-            first_grade = profile["progress"][0]["grade"]
-            latest_grade = profile["progress"][-1]["grade"]
-            improvement = latest_grade - first_grade
-            st.metric("Overall Improvement", f"{improvement} points", delta=improvement)
-
-    # Progress over time
-    st.subheader("Grade Progress")
-    if profile["progress"]:
-        progress_df = pd.DataFrame(profile["progress"])
-        fig = px.line(progress_df, x="timestamp", y="grade", markers=True,
-                      labels={"timestamp": "Submission Date", "grade": "Grade"},
-                      title="Grade Progress Over Time")
-        fig.update_layout(hovermode="x unified")
-        st.plotly_chart(fig, use_container_width=True)
-
-    # Submission history
-    st.subheader("Submission History")
-    if profile["history"]:
-        history_df = pd.DataFrame(profile["history"])
-
-        # Get unique key issues
-        all_issues = []
-        for entry in profile["history"]:
-            all_issues.extend(entry.get("key_issues", []))
-
-        # Count issue occurrences
-        issue_counts = {}
-        for issue in all_issues:
-            if issue in issue_counts:
-                issue_counts[issue] += 1
+        # Add new student
+        new_student = st.text_input("Add new student ID:")
+        if st.button("Add Student") and new_student:
+            if new_student not in st.session_state.student_profiles:
+                st.session_state.student_profiles[new_student] = {
+                    "history": [],
+                    "submissions": 0,
+                    "common_issues": {},
+                    "strengths": {},
+                    "progress": []
+                }
+                st.success(f"Added student: {new_student}")
             else:
-                issue_counts[issue] = 1
+                st.warning(f"Student {new_student} already exists")
 
-        # Common issues chart
-        if issue_counts:
-            st.subheader("Common Issues")
-            issue_df = pd.DataFrame({"Issue": list(issue_counts.keys()), "Count": list(issue_counts.values())})
-            issue_df = issue_df.sort_values("Count", ascending=False).head(5)
+        # Select existing student
+        students = list(st.session_state.student_profiles.keys())
+        if students:
+            selected_student = st.selectbox("Select Student:", options=students)
+            if selected_student != st.session_state.current_student:
+                st.session_state.current_student = selected_student
+                st.rerun()
+        else:
+            st.info("No students added yet")
 
-            fig = px.bar(issue_df, x="Count", y="Issue", orientation="h",
-                         title="Top 5 Most Common Issues")
-            st.plotly_chart(fig, use_container_width=True)
+        st.divider()
 
-        # Submission details
-        st.subheader("Recent Submissions")
-        for i, entry in enumerate(reversed(profile["history"])):
-            if i >= 5:  # Show only the 5 most recent submissions
-                break
+        # App navigation
+        st.subheader("Navigation")
+        app_mode = st.radio("Select Mode:", ["Code Submission", "Student Analytics", "Class Overview"])
 
-            with st.expander(f"{entry['assignment']} - {entry['timestamp']}"):
-                st.write(f"**Grade:** {entry['grade_estimate']}")
-                if entry.get("key_issues"):
-                    st.write("**Key Issues:**")
-                    for issue in entry["key_issues"]:
-                        st.write(f"- {issue}")
-
-
-# Class overview interface
-def display_class_overview():
-    st.header("Class Overview Dashboard")
-
-    if not st.session_state.student_profiles:
-        st.info("No student data available yet")
-        return
-
-    # General class metrics
-    total_students = len(st.session_state.student_profiles)
-    total_submissions = sum(profile["submissions"] for profile in st.session_state.student_profiles.values())
-
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric("Total Students", total_students)
-    with col2:
-        st.metric("Total Submissions", total_submissions)
-
-    # Student activity
-    st.subheader("Student Activity")
-
-    activity_data = []
-    for student_id, profile in st.session_state.student_profiles.items():
-        if profile["progress"]:
-            latest_grade = profile["progress"][-1]["grade"]
-            avg_grade = sum(entry["grade"] for entry in profile["progress"]) / len(profile["progress"])
-            activity_data.append({
-                "Student ID": student_id,
-                "Submissions": profile["submissions"],
-                "Latest Grade": latest_grade,
-                "Average Grade": round(avg_grade, 1)
-            })
-
-    if activity_data:
-        activity_df = pd.DataFrame(activity_data)
-        st.dataframe(activity_df.sort_values("Latest Grade", ascending=False), use_container_width=True)
-
-        # Grade distribution
-        st.subheader("Grade Distribution")
-
-        fig = px.histogram(activity_df, x="Latest Grade", nbins=10,
-                           title="Distribution of Latest Grades")
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("No grade data available yet")
-
-    # Recent feedback
-    st.subheader("Recent Feedback")
-
-    if st.session_state.feedback_history:
-        history = sorted(st.session_state.feedback_history, key=lambda x: x["timestamp"], reverse=True)[:10]
-        history_df = pd.DataFrame(history)
-        st.dataframe(history_df, use_container_width=True)
+    # Main content area based on selected mode
+    if app_mode == "Code Submission":
+        display_code_submission()
+    elif app_mode == "Student Analytics":
+        display_student_analytics()
+    else:  # Class Overview
+        display_class_overview()
 
 
 if __name__ == "__main__":
